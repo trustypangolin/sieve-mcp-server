@@ -89,6 +89,17 @@ export class SieveService {
     });
   }
 
+  /** Every script with its content, in one session. */
+  async getAllScripts(account: SieveAccount): Promise<Array<ScriptInfo & { content: string }>> {
+    return this.session(account, async (client) => {
+      const scripts = [];
+      for (const info of await client.listScripts()) {
+        scripts.push({ ...info, content: toLf(await client.getScript(info.name)) });
+      }
+      return scripts;
+    });
+  }
+
   async checkScript(account: SieveAccount, content: string): Promise<CheckOutcome> {
     return this.session(account, (client) => this.check(client, toCrlf(content)));
   }

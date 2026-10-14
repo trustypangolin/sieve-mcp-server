@@ -68,6 +68,22 @@ Each account is tested (connect, TLS, login) before it is saved. Pass `--skip-te
 claude mcp add --scope user sieve -- node /path/to/sieve-mcp-server/dist/index.js
 ```
 
+## Editing rules locally
+
+If you'd rather edit scripts in your own editor than through chat, use the setup CLI. `local-rules/` is gitignored, so your real rules never get committed.
+
+```bash
+node dist/setup.js pull                                    # every script → local-rules/<account>/<script>.sieve
+node dist/setup.js check "local-rules/Personal/My Rules.sieve"
+node dist/setup.js push  "local-rules/Personal/My Rules.sieve"   # validate, show diff, confirm, upload
+node dist/setup.js activate "My Rules"
+```
+
+- `pull` never overwrites a local file you've edited unless you pass `--force`.
+- `push` uses the file name as the script name; pass `--name` to override it. Like the MCP tool, it backs up the server copy first and never activates the script.
+
+[`samples/`](samples/) has commented example rules: filing, mailing lists, spam, vacation, flags, plus-addressing, attachments, and a complete combined script.
+
 ## One shared config for every client
 
 Accounts live in `~/.sieve-mcp/` (`%USERPROFILE%\.sieve-mcp\` on Windows):

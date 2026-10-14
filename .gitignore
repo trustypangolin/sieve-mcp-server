@@ -3,3 +3,6 @@ dist/
 coverage/
 *.log
 .env
+
+# Local working copies of real Sieve scripts (setup.js pull / push)
+/local-rules/

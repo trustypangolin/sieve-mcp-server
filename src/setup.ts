@@ -2,6 +2,7 @@
  * sieve-mcp-setup — manage accounts in the shared store from a terminal, so
  * passwords are typed here rather than pasted into a chat.
  */
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +11,7 @@ import { AccountManager, envVarName } from './services/account-manager.js';
 import { BackupStore } from './services/backup-store.js';
 import { configHome } from './paths.js';
 import { readImapMcpAccounts } from './services/imap-import.js';
+import { DEFAULT_RULES_DIR, pullScripts, scriptNameFromFile } from './services/local-rules.js';
 import { SieveService } from './services/sieve-service.js';
 import type { AccountInput, SieveAccount, TlsMode } from './types.js';
 
@@ -24,15 +26,25 @@ Commands:
   import-imap              Create accounts from imap-mcp-server's store (~/.imap-mcp)
   config                   Print MCP client configuration for Claude Desktop / Claude Code
 
+Working on rules locally:
+  pull                     Download every script to local-rules/<account>/ (keeps local edits unless --force)
+  check <file>             Have the server validate a local .sieve file
+  push <file>              Validate, show the diff, confirm, then upload (backs up the server copy;
+                           never activates — use the sieve_activate_script tool or activate <script>)
+  activate <script>        Make a server script the active one
+
 Options:
-  --name <name>            Account name (add, import-imap with --account)
+  --name <name>            add / import-imap: account name; push: script name (default: file name)
   --host <host>            ManageSieve host (import-imap: overrides the IMAP host)
   --port <port>            ManageSieve port (default 4190)
   --tls <mode>             starttls (default) | implicit | none
   --user <user>            Login name
   --password               update: prompt for a new password
   --allow-invalid-cert     Skip TLS certificate verification (self-signed certs)
-  --account <name>         import-imap: import only this IMAP account
+  --account <name>         Account to use (optional with one account); import-imap: the IMAP account
+  --dir <dir>              pull: target folder (default: local-rules/ in the project)
+  --force                  pull: overwrite local files that differ from the server
+  --yes                    push / activate: skip the confirmation prompt
   --imap-home <dir>        import-imap: imap-mcp-server config dir (default ~/.imap-mcp)
   --skip-test              Save without testing the connection first
 
@@ -101,10 +113,18 @@ async function testAccount(sieve: SieveService, account: SieveAccount): Promise<
   console.log(`  Extensions: ${caps.sieveExtensions.join(' ') || '(none reported)'}`);
 }
 
+/** Package root: this file runs from dist/ when built, src/ under tsx. */
+function packageRoot(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+}
+
 function serverEntryPath(): string {
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  // dist/setup.js sits next to dist/index.js; under tsx we run from src/.
-  return path.basename(here) === 'src' ? path.resolve(here, '..', 'dist', 'index.js') : path.join(here, 'index.js');
+  return path.join(packageRoot(), 'dist', 'index.js');
+}
+
+function printCheck(check: { valid: boolean; errors?: string; warnings?: string }): void {
+  if (!check.valid) console.error(`Server rejected the script:\n  ${check.errors}`);
+  else console.log(`Valid${check.warnings ? `, with warnings:\n  ${check.warnings}` : '.'}`);
 }
 
 function printConfig(): void {
@@ -135,6 +155,9 @@ async function main(): Promise<void> {
       account: { type: 'string' },
       'imap-home': { type: 'string' },
       'skip-test': { type: 'boolean' },
+      dir: { type: 'string' },
+      force: { type: 'boolean' },
+      yes: { type: 'boolean', short: 'y' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -249,6 +272,67 @@ async function main(): Promise<void> {
       case 'config':
         printConfig();
         break;
+
+      case 'pull': {
+        const account = accounts.resolve(undefined, values.account);
+        const root = path.resolve(values.dir ?? path.join(packageRoot(), DEFAULT_RULES_DIR));
+        const result = await pullScripts(sieve, account, root, { force: values.force });
+        console.log(`Scripts for "${account.name}" in ${result.dir}:`);
+        for (const f of result.written) console.log(`  saved      ${path.basename(f)}`);
+        for (const f of result.unchanged) console.log(`  unchanged  ${path.basename(f)}`);
+        for (const f of result.kept) console.log(`  KEPT       ${path.basename(f)} (local edits differ from server; --force to overwrite)`);
+        console.log(`Active script: ${result.active ?? '(none)'}`);
+        break;
+      }
+
+      case 'check': {
+        if (!target) throw new Error('Usage: sieve-mcp-setup check <file.sieve>');
+        const check = await sieve.checkScript(accounts.resolve(undefined, values.account), readFileSync(target, 'utf8'));
+        printCheck(check);
+        if (!check.valid) process.exitCode = 1;
+        break;
+      }
+
+      case 'push': {
+        if (!target) throw new Error('Usage: sieve-mcp-setup push <file.sieve> [--name <script>]');
+        const account = accounts.resolve(undefined, values.account);
+        const name = values.name ?? scriptNameFromFile(target);
+        const content = readFileSync(target, 'utf8');
+        const preview = await sieve.putScript(account, { name, content, overwrite: true, dryRun: true });
+        printCheck(preview.check);
+        if (!preview.check.valid) {
+          process.exitCode = 1;
+          break;
+        }
+        if (preview.unchanged) {
+          console.log(`"${name}" on the server is already identical; nothing to do.`);
+          break;
+        }
+        console.log(`\n${preview.diff}`);
+        const what = preview.existed
+          ? `Replace "${name}"${preview.active ? ' — it is ACTIVE, so this takes effect immediately' : ''}`
+          : `Create new script "${name}" (it will not be active)`;
+        if (!values.yes && (await prompt.ask(`${what}. Continue? [y/N]`)).toLowerCase() !== 'y') {
+          console.log('Cancelled; nothing was uploaded.');
+          break;
+        }
+        const result = await sieve.putScript(account, { name, content, overwrite: true });
+        console.log(result.note);
+        if (result.backupFile) console.log(`Previous version backed up to ${result.backupFile}`);
+        break;
+      }
+
+      case 'activate': {
+        if (!target) throw new Error('Usage: sieve-mcp-setup activate <script name>');
+        const account = accounts.resolve(undefined, values.account);
+        if (!values.yes && (await prompt.ask(`Make "${target}" the active filter for "${account.name}"? [y/N]`)).toLowerCase() !== 'y') {
+          console.log('Cancelled.');
+          break;
+        }
+        const result = await sieve.activate(account, target);
+        console.log(`"${result.active}" is now active${result.previouslyActive ? ` (was "${result.previouslyActive}")` : ''}.`);
+        break;
+      }
 
       default:
         console.log(USAGE);
